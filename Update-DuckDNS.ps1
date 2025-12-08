@@ -1,12 +1,13 @@
-# Updated for PowerShell 7 compatibility
+# Updated for PowerShell 7 compatibility.
 # Original: https://github.com/ataylor32/duckdns-powershell
 <#
 .SYNOPSIS
-	Updates the IP address of your Duck DNS domain(s).
+	Updates the IP address of your Duck DNS domain(s) and emits a result object.
 .DESCRIPTION
 	Updates the IP address of your Duck DNS domain(s). Intended to be run as a
 	scheduled task. This version is compatible with PowerShell 7+ and Windows
-	PowerShell.
+	PowerShell and always writes a result object to stdout so automation can
+	inspect the result.
 .PARAMETER Domains
 	A comma-separated list (or array) of your Duck DNS domains to update.
 .PARAMETER Token
@@ -14,12 +15,6 @@
 .PARAMETER IP
 	The IP address to use. If you leave it blank, Duck DNS will detect your
 	gateway IP.
-.INPUTS
-	None. You cannot pipe objects to this script.
-.OUTPUTS
-	None. This script does not generate any output by default.
-.EXAMPLE
-	.\Update-DuckDNS.ps1 -Domains "foo,bar" -Token my-duck-dns-token
 #>
 
 Param (
@@ -38,49 +33,96 @@ Param (
 	[string]$IP
 )
 
-# Normalise domains to a single comma-separated string (accepts array or single string)
+# Normalize domains to a single comma-separated string (accepts array or single string)
 if ($Domains -is [System.Array]) {
 	$DomainsString = ($Domains -join ',').Trim()
 } else {
 	$DomainsString = $Domains.Trim()
 }
 
-# Build URL (IP may be empty)
-$URL = "https://www.duckdns.org/update?domains={0}&token={1}&ip={2}" -f [uri]::EscapeDataString($DomainsString), [uri]::EscapeDataString($Token), [uri]::EscapeDataString($IP)
+# Ensure values passed to EscapeDataString are never $null
+$DomainsEsc = [uri]::EscapeDataString($DomainsString)
+$TokenEsc = [uri]::EscapeDataString($Token)
+$IPEsc = [uri]::EscapeDataString(($IP -ne $null) ? $IP : '')
+
+$URL = "https://www.duckdns.org/update?domains={0}&token={1}&ip={2}" -f $DomainsEsc, $TokenEsc, $IPEsc
 
 Write-Debug "`$URL set to $URL"
 Write-Verbose "Sending update request to Duck DNS..."
 
-$ResponseString = $null
+# Helper to coerce various response types into a string safely
+function Convert-ToString {
+	param([Parameter(Mandatory=$true)][object]$InputObj)
 
-try {
-	# Preferred modern approach: Invoke-WebRequest works in PowerShell 3+ including PowerShell 7.
-	$Result = Invoke-WebRequest -Uri $URL -UseBasicParsing:$false -ErrorAction Stop
+	if ($InputObj -eq $null) { return $null }
 
-	# Try several ways to extract the response body/content for compatibility across versions
-	$ResponseString = $null
-
-	# If object has Content property (PowerShell Core / modern PS), use it
-	if ($Result -ne $null) {
-		# Expand Content if available
-		$Content = $null
-		try { $Content = $Result.Content } catch { $Content = $null }
-		if ([string]::IsNullOrEmpty($Content)) {
-			# Fallback to using the RawContent, innerxml, or ToString()
-			# RawContent is available on some platforms; use whichever is present
-			if ($Result -is [string]) {
-				$ResponseString = $Result
-			} else {
-				$ResponseString = ($Result.RawContent -as [string]) -or ($Result.InnerXml -as [string]) -or ($Result.ToString())
-			}
-		} else {
-			$ResponseString = $Content
+	# If it's a byte array, assume UTF8
+	if ($InputObj -is [byte[]]) {
+		try {
+			return [System.Text.Encoding]::UTF8.GetString([byte[]]$InputObj)
+		} catch {
+			# fallback: ASCII
+			return [System.Text.Encoding]::ASCII.GetString([byte[]]$InputObj)
 		}
 	}
+
+	# If it's already a string
+	if ($InputObj -is [string]) {
+		return $InputObj
+	}
+
+	# If it's a stream, read it
+	if ($InputObj -is [System.IO.Stream]) {
+		try {
+			$sr = New-Object System.IO.StreamReader($InputObj)
+			$ret = $sr.ReadToEnd()
+			$sr.Close()
+			return $ret
+		} catch {}
+	}
+
+	# Some Invoke-WebRequest results include a .Content property which itself may be stream/bytes/string
+	try {
+		if ($InputObj -ne $null) {
+			# Try common properties
+			foreach ($prop in 'Content','RawContent','InnerXml') {
+				if ($InputObj.PSObject.Properties.Name -contains $prop) {
+					$val = $InputObj.$prop
+					if ($val -ne $null) { return Convert-ToString -InputObj $val }
+				}
+			}
+		}
+	} catch {}
+
+	# Last resort: ToString()
+	try {
+		return $InputObj.ToString()
+	} catch {
+		return $null
+	}
 }
-catch [System.Net.WebException] {
-	# If Invoke-WebRequest failed (older environments), fall back to System.Net.WebRequest
-	Write-Verbose "Invoke-WebRequest failed, falling back to System.Net.WebRequest. $_"
+
+$ResponseString = $null
+$ErrorMessage = $null
+
+try {
+	# Try modern Invoke-WebRequest first
+	$Result = Invoke-WebRequest -Uri $URL -ErrorAction Stop
+
+	if ($Result -ne $null) {
+		# Extract candidate and convert to string
+		$Candidate = $null
+		if ($Result.PSObject.Properties.Name -contains 'Content') { $Candidate = $Result.Content }
+		elseif ($Result.PSObject.Properties.Name -contains 'RawContent') { $Candidate = $Result.RawContent }
+		elseif ($Result.PSObject.Properties.Name -contains 'InnerXml') { $Candidate = $Result.InnerXml }
+		else { $Candidate = $Result.ToString() }
+
+		$ResponseString = Convert-ToString -InputObj $Candidate
+	}
+}
+catch {
+	# If Invoke-WebRequest failed, try fallback
+	Write-Verbose "Invoke-WebRequest failed or threw; falling back to System.Net.WebRequest. $_"
 	try {
 		$Request = [System.Net.WebRequest]::Create($URL)
 		$Response = $Request.GetResponse()
@@ -92,27 +134,56 @@ catch [System.Net.WebException] {
 		}
 	}
 	catch {
-		throw "HTTP request failed: $_"
+		$ErrorMessage = "HTTP request failed: $_"
 	}
 }
-catch {
-	throw "HTTP request failed: $_"
+
+if ($null -eq $ResponseString -and $null -eq $ErrorMessage) {
+	$ErrorMessage = "No response received from Duck DNS."
 }
 
-if ($null -eq $ResponseString) {
-	throw "No response received from Duck DNS."
+# Ensure string type before Trim
+if ($ResponseString -isnot [string] -and $ResponseString -ne $null) {
+	$ResponseString = Convert-ToString -InputObj $ResponseString
 }
 
-# Trim whitespace/newlines and normalise
-$ResponseString = $ResponseString.Trim()
+if ($ResponseString -ne $null) {
+	$ResponseString = $ResponseString.Trim()
+}
+
+$Success = $false
+$Message = $null
 
 if ($ResponseString -eq "OK") {
-	Write-Verbose "Update successful."
+	$Success = $true
+	$Message = "Update successful."
 }
 elseif ($ResponseString -eq "KO") {
-	throw "Update failed (Duck DNS returned KO)."
+	$Success = $false
+	$Message = "Update failed (Duck DNS returned KO)."
+}
+elseif ($ErrorMessage) {
+	$Success = $false
+	$Message = $ErrorMessage
 }
 else {
-	# Some responses may include other text (or multiple lines); include it in the message for debugging
-	Write-Verbose "Unexpected response from Duck DNS: '$ResponseString'"
+	$Success = $false
+	$Message = "Unexpected response from Duck DNS: '$ResponseString'"
+	Write-Verbose $Message
 }
+
+# Build result object (do NOT include the token)
+$result = [PSCustomObject]@{
+	Timestamp = (Get-Date).ToString("o")
+	Domains   = $DomainsString
+	IP        = if ($IP) { $IP } else { "" }
+	Response  = $ResponseString
+	Success   = $Success
+	Message   = $Message
+}
+
+# Emit the result for automation to consume
+Write-Output $result
+
+# Use exit code for automation: 0 = success, 1 = failure
+if ($Success) { exit 0 } else { exit 1 }
